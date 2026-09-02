@@ -1,0 +1,9 @@
+{
+	"id": "social-converter",
+	"name": "Social Converter",
+	"version": "0.0.1",
+	"minAppVersion": "1.7.2",
+	"description": "Turn notes into numbered Bluesky threads and themed Instagram images without changing the source note.",
+	"author": "Kornelius Paede",
+	"isDesktopOnly": false
+}
