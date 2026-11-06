@@ -7,7 +7,7 @@ import process from 'node:process';
 import assert from 'node:assert/strict';
 
 const root = path.resolve(import.meta.dirname, '..');
-const candidates = [process.env.SOCIAL_CONVERTER_CHROME, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/chromium', '/usr/bin/chromium-browser', '/usr/bin/google-chrome'].filter(Boolean);
+const candidates = [process.env.SOCIAL_CONVERTER_CHROME, '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome', '/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium', '/usr/bin/chromium-browser'].filter(Boolean);
 let chrome;
 for (const candidate of candidates) {
  try { await access(candidate); chrome = candidate; break; } catch { /* Try the next installed browser. */ }
@@ -25,9 +25,10 @@ try {
  await build({ entryPoints: [path.join(root, 'tests/fixtures/regressions.mjs')], outfile: path.join(directory, 'test.js'), bundle: true, format: 'iife', plugins: [{ name: 'obsidian-test-host', setup(builder) {
   builder.onResolve({ filter: /^obsidian$/ }, () => ({ path: path.join(root, 'tests/fixtures/obsidian.mjs') }));
  } }] });
+ console.log('Browser:', chrome);
  child = spawn(chrome, ['--headless', '--disable-gpu', '--no-sandbox', '--no-first-run', '--disable-background-networking', '--allow-file-access-from-files', `--user-data-dir=${path.join(directory, 'profile')}`, '--remote-debugging-port=0', 'about:blank'], { stdio: ['ignore', 'ignore', 'pipe'] });
  const url = await new Promise((resolve, reject) => {
-  let log = ''; const timeout = setTimeout(() => reject(new Error('Chrome startup timeout: ' + log)), 15000);
+  let log = ''; const timeout = setTimeout(() => reject(new Error('Chrome startup timeout: ' + log)), 45000);
   child.stderr.on('data', (chunk) => { log += chunk; const match = log.match(/DevTools listening on (ws:\/\/[^\s]+)/); if (match) { clearTimeout(timeout); resolve(match[1]); } });
   child.on('error', (error) => { clearTimeout(timeout); reject(error); });
   child.on('exit', (code) => { clearTimeout(timeout); reject(new Error('Chrome exited: ' + code)); });
