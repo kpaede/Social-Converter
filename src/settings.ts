@@ -1,7 +1,15 @@
 import { App, PluginSettingTab, Setting } from 'obsidian';
 import type SocialConverterPlugin from './main';
 
+export const MIN_FONT_SCALE = 25;
+export const MAX_FONT_SCALE = 300;
+
+export function normalizeFontScale(value: number): number {
+	return Number.isFinite(value) ? Math.min(MAX_FONT_SCALE, Math.max(MIN_FONT_SCALE, Math.round(value))) : 100;
+}
+
 export interface SocialConverterSettings {
+	fontScale: number;
 	postWidth: number;
 	postHeight: number;
 	storyWidth: number;
@@ -11,6 +19,7 @@ export interface SocialConverterSettings {
 }
 
 export const DEFAULT_SETTINGS: SocialConverterSettings = {
+	fontScale: 100,
 	postWidth: 1080,
 	postHeight: 1350,
 	storyWidth: 1080,
@@ -24,6 +33,8 @@ export class SocialConverterSettingTab extends PluginSettingTab {
 
 	display(): void {
 		this.containerEl.empty();
+		new Setting(this.containerEl).setName('Instagram typography').setHeading();
+		this.addNumber('Global font size', 'Percentage of the selected theme’s font sizes. Individual slides can override this in the converter.', 'fontScale', 100, MIN_FONT_SCALE, MAX_FONT_SCALE);
 		new Setting(this.containerEl).setName('Instagram image sizes').setHeading();
 		this.addNumber('Post width', 'PNG width in pixels.', 'postWidth', 1080);
 		this.addNumber('Post height', 'PNG height in pixels.', 'postHeight', 1350);
@@ -42,7 +53,7 @@ export class SocialConverterSettingTab extends PluginSettingTab {
 				}));
 	}
 
-	private addNumber(name: string, description: string, key: 'postWidth' | 'postHeight' | 'storyWidth' | 'storyHeight' | 'blueskyMaxLength', fallback: number, min = 100, max = 5000): void {
+	private addNumber(name: string, description: string, key: 'fontScale' | 'postWidth' | 'postHeight' | 'storyWidth' | 'storyHeight' | 'blueskyMaxLength', fallback: number, min = 100, max = 5000): void {
 		new Setting(this.containerEl).setName(name).setDesc(description).addText((text) => {
 			text.inputEl.type = 'number';
 			text.inputEl.min = String(min);

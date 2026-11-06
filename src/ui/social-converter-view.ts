@@ -1,65 +1,144 @@
-import { ItemView, loadPdfJs, MarkdownRenderer, Notice, TFile, WorkspaceLeaf } from 'obsidian';
+import { Component, ItemView, MarkdownRenderer, Notice, TFile, WorkspaceLeaf } from 'obsidian';
 import { createBlueskyThread, extractInstagramBlocks } from '../utils/content';
 import { exportCardAsPng, exportPngZip, renderCardToPng } from '../utils/png-export';
+import { createCardPreview, setCardFontScale, type ColorMode } from './card-preview';
+import { normalizeFontScale } from '../settings';
+import { addFontSizeControl, type FontSizeControl } from './font-size-control';
+import { PdfPreviews } from '../utils/pdf-previews';
+import { ThemeStyles } from './theme-styles';
 import type SocialConverterPlugin from '../main';
 
 export const VIEW_TYPE_SOCIAL_CONVERTER = 'social-converter-view';
 type Platform = 'bluesky' | 'instagram';
 type CardFormat = 'post' | 'story';
-type ColorMode = 'light' | 'dark';
-interface ThemeManager {
-	theme: string;
-	themes: Record<string, { name?: string }>;
+interface ConverterState {
+	file?: string;
+	colorMode?: ColorMode;
+	selectedTheme?: string;
+	format?: CardFormat;
+	platform?: Platform;
+	slideFontScales?: Record<string, number>;
+	noteFontScales?: Record<string, Record<string, number>>;
 }
-interface PdfViewport { width: number; height: number; }
-interface PdfPage {
-	getViewport(options: { scale: number }): PdfViewport;
-	render(options: { canvas: HTMLCanvasElement; canvasContext: CanvasRenderingContext2D; viewport: PdfViewport }): { promise: Promise<void> };
-}
-interface PdfDocument {
-	numPages: number;
-	getPage(page: number): Promise<PdfPage>;
-	destroy(): Promise<void>;
-}
-interface PdfJsApi {
-	getDocument(options: { data: Uint8Array }): { promise: Promise<PdfDocument> };
-}
-
 export class SocialConverterView extends ItemView {
 	private file: TFile | null = null;
 	private source = '';
+	private sourceVersion = 0;
+	private readonly noteFontScales = new Map<TFile, Record<string, number>>();
 	private platform: Platform = 'bluesky';
 	private format: CardFormat = 'post';
 	private colorMode: ColorMode = activeDocument.body.hasClass('theme-dark') ? 'dark' : 'light';
 	private selectedTheme = '';
-	private readonly themeCssCache = new Map<string, string>();
-	private readonly pdfPreviewCache = new Map<string, string>();
+	private slideFontScales: Record<string, number> = {};
+	private renderComponent: Component | null = null;
+	private renderVersion = 0;
+	private layoutSettingsKey = '';
+	private globalFontControl: FontSizeControl | null = null;
+	private readonly cardPreviews = new Map<number, HTMLIFrameElement>();
+	private readonly fontControls = new Map<number, { control: FontSizeControl; reset: HTMLButtonElement }>();
+	private readonly themes: ThemeStyles;
+	private readonly pdfPreviews: PdfPreviews;
 
-	constructor(leaf: WorkspaceLeaf, private readonly plugin: SocialConverterPlugin) { super(leaf); }
+	constructor(leaf: WorkspaceLeaf, private readonly plugin: SocialConverterPlugin) {
+		super(leaf);
+		this.themes = new ThemeStyles(this.app);
+		this.pdfPreviews = new PdfPreviews(this.app);
+	}
 	getViewType(): string { return VIEW_TYPE_SOCIAL_CONVERTER; }
 	getDisplayText(): string { return 'Social converter'; }
 	getIcon(): string { return 'share-2'; }
 
-	async setState(state: { file?: string }, result: { history: boolean }): Promise<void> {
+	async setState(state: ConverterState, result: { history: boolean }): Promise<void> {
 		await super.setState(state, result);
-		const candidate = state.file ? this.app.vault.getAbstractFileByPath(state.file) : null;
-		this.file = candidate instanceof TFile ? candidate : null;
+		if (state.noteFontScales) {
+			for (const [path, scales] of Object.entries(state.noteFontScales)) {
+				const note = this.app.vault.getAbstractFileByPath(path);
+				if (note instanceof TFile && note.extension === 'md') this.noteFontScales.set(note, this.normalizeSlideFontScales(scales));
+			}
+		}
+		const savedFile = state.file ? this.app.vault.getAbstractFileByPath(state.file) : null;
+		if (savedFile instanceof TFile && state.slideFontScales) this.noteFontScales.set(savedFile, this.normalizeSlideFontScales(state.slideFontScales));
+		const activeFile = this.app.workspace.getActiveFile();
+		const candidate = activeFile instanceof TFile && activeFile.extension === 'md' ? activeFile : savedFile;
+		this.selectFile(candidate instanceof TFile && candidate.extension === 'md' ? candidate : null);
+		if (state.colorMode === 'dark' || state.colorMode === 'light') this.colorMode = state.colorMode;
+		if (typeof state.selectedTheme === 'string') this.selectedTheme = state.selectedTheme;
+		if (state.format === 'post' || state.format === 'story') this.format = state.format;
+		if (state.platform === 'instagram' || state.platform === 'bluesky') this.platform = state.platform;
 		await this.refreshSource();
 	}
 
+	getState(): Record<string, unknown> {
+		return { ...super.getState(), file: this.file?.path, colorMode: this.colorMode, selectedTheme: this.selectedTheme,
+			format: this.format, platform: this.platform, slideFontScales: { ...this.slideFontScales },
+			noteFontScales: Object.fromEntries(Array.from(this.noteFontScales, ([file, scales]) => [file.path, { ...scales }])) };
+	}
+
+	private normalizeSlideFontScales(scales: Record<string, number>): Record<string, number> {
+		return Object.fromEntries(Object.entries(scales)
+			.filter(([key, value]) => /^\d+$/.test(key) && typeof value === 'number')
+			.map(([key, value]) => [key, normalizeFontScale(value)]));
+	}
+
+	private selectFile(file: TFile | null): void {
+		if (file !== this.file) ++this.renderVersion;
+		this.file = file;
+		this.slideFontScales = file ? this.noteFontScales.get(file) ?? {} : {};
+		if (file) this.noteFontScales.set(file, this.slideFontScales);
+	}
+
 	async onOpen(): Promise<void> {
+		this.registerEvent(this.app.workspace.on('file-open', (file) => {
+			if (!(file instanceof TFile) || file.extension !== 'md' || file === this.file) return;
+			this.selectFile(file);
+			void this.refreshSource();
+		}));
+		const activeFile = this.app.workspace.getActiveFile();
+		if (activeFile instanceof TFile && activeFile.extension === 'md') this.selectFile(activeFile);
 		this.registerEvent(this.app.vault.on('modify', (file) => { if (file === this.file) void this.refreshSource(); }));
 		await this.refreshSource();
 	}
 
-	async refresh(): Promise<void> { await this.renderView(); }
+	async refresh(): Promise<void> {
+		if (this.platform === 'instagram' && this.layoutSettingsKey === this.getLayoutSettingsKey()) this.updateFontSizes();
+		else await this.renderView();
+	}
+
+	private getLayoutSettingsKey(): string {
+		return JSON.stringify({ ...this.plugin.settings, fontScale: undefined });
+	}
+
+	private updateFontSizes(): void {
+		const globalScale = this.plugin.settings.fontScale;
+		this.globalFontControl?.setValue(globalScale);
+		for (const [index, frame] of this.cardPreviews) setCardFontScale(frame, this.slideFontScales[index] ?? globalScale);
+		for (const [index, { control, reset }] of this.fontControls) {
+			control.setValue(this.slideFontScales[index] ?? globalScale);
+			reset.disabled = this.slideFontScales[index] === undefined;
+		}
+		this.app.workspace.requestSaveLayout();
+	}
 
 	private async refreshSource(): Promise<void> {
-		if (this.file) this.source = await this.app.vault.cachedRead(this.file);
+		const file = this.file;
+		const version = ++this.sourceVersion;
+		const source = file ? await this.app.vault.cachedRead(file) : '';
+		if (file !== this.file || version !== this.sourceVersion) return;
+		this.source = source;
 		await this.renderView();
 	}
 
 	private async renderView(): Promise<void> {
+		const version = ++this.renderVersion;
+		this.layoutSettingsKey = this.getLayoutSettingsKey();
+		this.cardPreviews.clear();
+		this.fontControls.clear();
+		this.globalFontControl = null;
+		if (this.renderComponent) this.removeChild(this.renderComponent);
+		const component = new Component();
+		this.addChild(component);
+		this.renderComponent = component;
+		this.app.workspace.requestSaveLayout();
 		const root = this.contentEl;
 		root.empty();
 		root.addClass('social-converter');
@@ -76,7 +155,7 @@ export class SocialConverterView extends ItemView {
 		this.addTab(tabs, 'instagram', 'Instagram');
 		const content = root.createDiv({ cls: 'social-converter__content' });
 		if (this.platform === 'bluesky') this.renderBluesky(content);
-		else await this.renderInstagram(content);
+		else await this.renderInstagram(content, component, version);
 	}
 
 	private addTab(container: HTMLElement, platform: Platform, label: string): void {
@@ -107,7 +186,7 @@ export class SocialConverterView extends ItemView {
 		}
 	}
 
-	private async renderInstagram(container: HTMLElement): Promise<void> {
+	private async renderInstagram(container: HTMLElement, component: Component, version: number): Promise<void> {
 		const blocks = extractInstagramBlocks(this.source);
 		const intro = container.createDiv({ cls: 'social-converter__intro' });
 		intro.createEl('h3', { text: `Instagram · ${blocks.length} ${blocks.length === 1 ? 'card' : 'cards'}` });
@@ -122,7 +201,7 @@ export class SocialConverterView extends ItemView {
 		const appearance = intro.createDiv({ cls: 'social-converter__appearance' });
 		const themeSelect = appearance.createEl('select', { attr: { 'aria-label': 'Preview theme' } });
 		themeSelect.createEl('option', { text: 'Current theme', value: '' });
-		for (const [id, name] of this.getInstalledThemes()) themeSelect.createEl('option', { text: name, value: id });
+		for (const [id, name] of this.themes.getInstalledThemes()) themeSelect.createEl('option', { text: name, value: id });
 		themeSelect.value = this.selectedTheme;
 		themeSelect.addEventListener('change', () => { this.selectedTheme = themeSelect.value; void this.renderView(); });
 		const modeSwitcher = appearance.createDiv({ cls: 'social-converter__mode-switcher' });
@@ -131,6 +210,12 @@ export class SocialConverterView extends ItemView {
 			button.toggleClass('is-active', mode === this.colorMode);
 			button.addEventListener('click', () => { this.colorMode = mode; void this.renderView(); });
 		}
+		this.globalFontControl = addFontSizeControl(intro, 'Global font size', this.plugin.settings.fontScale, (value) => {
+			this.plugin.settings.fontScale = value;
+			this.updateFontSizes();
+			void this.plugin.saveSettings();
+		});
+		intro.createEl('p', { text: '100% uses the selected theme’s font sizes. Slides use the global size unless you override them. Text never resizes automatically.' });
 		if (!blocks.length) {
 			container.createDiv({ cls: 'social-converter__empty', text: 'This note contains no slide content.' });
 			return;
@@ -139,20 +224,36 @@ export class SocialConverterView extends ItemView {
 		const renderedCards: HTMLElement[] = [];
 		for (const [index, block] of blocks.entries()) {
 			const item = gallery.createDiv({ cls: 'social-converter__gallery-item' });
-			const density = this.getTextDensity(block.content);
+			const sizeControl = addFontSizeControl(item, `Slide ${index + 1} font size`, this.slideFontScales[index] ?? this.plugin.settings.fontScale, (value) => {
+				this.slideFontScales[index] = value;
+				this.updateFontSizes();
+			});
+			const reset = sizeControl.container.createEl('button', { text: 'Use global size' });
+			reset.disabled = this.slideFontScales[index] === undefined;
+			reset.addEventListener('click', () => { delete this.slideFontScales[index]; this.updateFontSizes(); });
+			this.fontControls.set(index, { control: sizeControl, reset });
 			const card = item.createDiv({ cls: `social-converter__image social-converter__image--${this.format}` });
 			const format = this.getFormat(this.format);
 			const dimensions: Record<string, string> = { 'aspect-ratio': `${format.width} / ${format.height}` };
 			card.setCssProps(dimensions);
 			const staging = item.createDiv({ cls: 'social-converter__staging' });
-			await MarkdownRenderer.render(this.app, block.content, staging, this.file?.path ?? '', this);
-			await this.replacePdfEmbeds(staging);
-			const capture = await this.createIsolatedCard(card, staging, density);
+			await MarkdownRenderer.render(this.app, block.content, staging, this.file?.path ?? '', component);
+			if (version !== this.renderVersion) return;
+			await this.pdfPreviews.replaceEmbeds(staging, this.file?.path ?? '');
+			if (version !== this.renderVersion) return;
+			const themeId = this.selectedTheme || this.themes.currentTheme;
+			const themeCss = themeId ? await this.themes.read(themeId) : '';
+			if (version !== this.renderVersion) return;
+			const capture = await createCardPreview(card, staging, {
+				...format, colorMode: this.colorMode, themeCss: themeCss ?? '',
+				fontScale: this.slideFontScales[index] ?? this.plugin.settings.fontScale,
+				component, isCurrent: () => version === this.renderVersion,
+			});
+			if (version !== this.renderVersion) return;
 			staging.remove();
 			renderedCards.push(capture);
-			if (block.content.length > 700) {
-				item.createDiv({ cls: 'social-converter__warning', text: 'This card contains a lot of text. Consider splitting it into another card.' });
-			}
+			this.cardPreviews.set(index, capture);
+			setCardFontScale(capture, this.slideFontScales[index] ?? this.plugin.settings.fontScale);
 			const actions = item.createDiv({ cls: 'social-converter__image-actions' });
 			const exportButton = actions.createEl('button', { text: 'Save image' });
 			exportButton.addEventListener('click', () => {
@@ -163,161 +264,6 @@ export class SocialConverterView extends ItemView {
 		}
 		const zipButton = container.createEl('button', { cls: 'mod-cta social-converter__zip', text: `Save all ${this.format} cards as ZIP` });
 		zipButton.addEventListener('click', () => { void this.exportAllCards(renderedCards, zipButton); });
-	}
-
-	private getTextDensity(content: string): 'short' | 'medium' | 'long' | 'dense' {
-		const length = content.replace(/\s+/g, ' ').trim().length;
-		if (length <= 140) return 'short';
-		if (length <= 320) return 'medium';
-		if (length <= 550) return 'long';
-		return 'dense';
-	}
-
-	private async createIsolatedCard(card: HTMLElement, staging: HTMLElement, density: 'short' | 'medium' | 'long' | 'dense'): Promise<HTMLElement> {
-		const frame = card.createEl('iframe', { cls: 'social-converter__theme-frame', attr: { title: 'Instagram card preview' } });
-		const themeId = this.selectedTheme || this.getThemeManager()?.theme || '';
-		const themeCss = themeId ? await this.readThemeCss(themeId) : null;
-		const isolatedCss = `
-			:root { ${this.getBaselineVariables()} }
-			${themeCss ?? ''}
-			html, body { box-sizing: border-box; width: 100%; height: 100%; margin: 0; overflow: hidden; background: var(--background-primary); color: var(--text-normal); }
-			body { container-type: inline-size; }
-			.social-converter-card-capture { box-sizing: border-box; display: flex; align-items: center; justify-content: center; width: 100%; height: 100%; overflow: hidden; background: var(--background-primary); color: var(--text-normal); font-family: var(--font-text-theme, var(--font-text)); }
-			.social-converter__image-content { box-sizing: border-box; width: 100%; max-height: 100%; overflow: hidden; padding: 10%; }
-			.density-short .social-converter__image-content { font-size: clamp(24px, 7.2cqw, 48px); }
-			.density-medium .social-converter__image-content { font-size: clamp(21px, 5.6cqw, 38px); }
-			.density-long .social-converter__image-content { font-size: clamp(18px, 4.4cqw, 30px); }
-			.density-dense .social-converter__image-content { font-size: clamp(15px, 3.5cqw, 24px); }
-			.social-converter__image-content > :first-child { margin-top: 0; }
-			.social-converter__image-content > :last-child { margin-bottom: 0; }
-			.social-converter__image-content :is(.internal-embed, .image-embed, .media-embed, .file-embed) { box-sizing: border-box !important; display: flex !important; align-items: center !important; justify-content: center !important; width: 100% !important; max-width: 100% !important; max-height: 52cqh !important; margin-inline: auto !important; overflow: hidden !important; font-size: clamp(12px, 2.6cqw, 18px) !important; }
-			.social-converter__image-content :is(img, video, canvas) { display: block !important; width: auto !important; height: auto !important; max-width: 100% !important; max-height: 52cqh !important; margin-inline: auto !important; object-fit: contain !important; }
-			.social-converter__image-content :is(svg) { max-width: 100% !important; max-height: 52cqh !important; }
-			.social-converter__image-content :is(.pdf-embed, .media-embed):has(iframe),
-			.social-converter__image-content iframe { display: block !important; width: 100% !important; min-width: 0 !important; height: 46cqh !important; max-height: 46cqh !important; border: 0 !important; }
-			.social-converter__image-content :is(.markdown-embed, .internal-embed):not(.image-embed):not(.media-embed) { align-items: flex-start !important; justify-content: flex-start !important; overflow: auto !important; }
-			.social-converter__image-content :is(.markdown-embed-content, .markdown-embed-content > .markdown-preview-view) { box-sizing: border-box !important; width: 100% !important; max-height: 48cqh !important; overflow: hidden !important; font-size: clamp(12px, 2.6cqw, 18px) !important; }
-		`;
-		const safeCss = isolatedCss.replace(/<\/style/gi, '<\\/style');
-		const loaded = new Promise<void>((resolve) => {
-			frame.addEventListener('load', () => resolve(), { once: true });
-		});
-		frame.setAttribute('srcdoc', `<!doctype html><html><head><meta charset="utf-8"><style>${safeCss}</style></head><body class="theme-${this.colorMode}"></body></html>`);
-		await loaded;
-		const frameDocument = frame.contentDocument;
-		if (!frameDocument) throw new Error('Could not create isolated theme preview');
-		const capture = frameDocument.createElementNS('http://www.w3.org/1999/xhtml', 'div');
-		capture.className = `social-converter-card-capture density-${density}`;
-		const markdown = frameDocument.createElementNS('http://www.w3.org/1999/xhtml', 'div');
-		markdown.className = 'markdown-rendered markdown-preview-view social-converter__image-content';
-		for (const child of Array.from(staging.childNodes)) markdown.appendChild(frameDocument.importNode(child, true));
-		capture.appendChild(markdown);
-		frameDocument.body.appendChild(capture);
-		await frameDocument.fonts.ready;
-		return frame;
-	}
-
-	private getBaselineVariables(): string {
-		const style = getComputedStyle(activeDocument.body);
-		return Array.from(style)
-			.filter((property) => property.startsWith('--'))
-			.map((property) => `${property}: ${style.getPropertyValue(property)};`)
-			.join(' ');
-	}
-
-	private async replacePdfEmbeds(container: HTMLElement): Promise<void> {
-		const candidates = Array.from(container.querySelectorAll<HTMLElement>('.internal-embed, .pdf-embed'));
-		const embeds = candidates.filter((element) => {
-			const reference = element.getAttribute('src') ?? element.getAttribute('data-href') ?? '';
-			return /\.pdf(?:#|$)/i.test(reference) && !element.parentElement?.closest('.internal-embed[src*=".pdf" i]');
-		});
-		for (const embed of embeds) {
-			const reference = embed.getAttribute('src') ?? embed.getAttribute('data-href') ?? '';
-			try {
-				const preview = await this.renderPdfPreview(reference);
-				const image = activeDocument.createElementNS('http://www.w3.org/1999/xhtml', 'img');
-				image.setAttribute('src', preview);
-				image.setAttribute('alt', `PDF preview: ${reference}`);
-				image.className = 'social-converter__pdf-page';
-				embed.replaceWith(image);
-			} catch (error) {
-				console.error(`Social Converter could not render PDF: ${reference}`, error);
-				const fallback = activeDocument.createElementNS('http://www.w3.org/1999/xhtml', 'div');
-				fallback.className = 'social-converter__pdf-fallback';
-				fallback.textContent = `PDF: ${reference.split('#')[0] ?? reference}`;
-				embed.replaceWith(fallback);
-			}
-		}
-	}
-
-	private async renderPdfPreview(reference: string): Promise<string> {
-		const [linkPath = '', fragment = ''] = reference.split('#', 2);
-		const pageNumber = Math.max(1, Number.parseInt(fragment.match(/(?:^|&)page=(\d+)/i)?.[1] ?? '1', 10));
-		const sourcePath = this.file?.path ?? '';
-		const pdfFile = this.app.metadataCache.getFirstLinkpathDest(linkPath, sourcePath);
-		if (!(pdfFile instanceof TFile) || pdfFile.extension.toLowerCase() !== 'pdf') throw new Error(`PDF file not found: ${linkPath}`);
-		const cacheKey = `${pdfFile.path}#page=${pageNumber}`;
-		const cached = this.pdfPreviewCache.get(cacheKey);
-		if (cached) return cached;
-
-		const pdfJs = await loadPdfJs() as unknown as PdfJsApi;
-		const bytes = new Uint8Array(await this.app.vault.readBinary(pdfFile));
-		const loadingTask = pdfJs.getDocument({ data: bytes });
-		const document = await loadingTask.promise;
-		try {
-			const page = await document.getPage(Math.min(pageNumber, document.numPages));
-			const initial = page.getViewport({ scale: 1 });
-			const viewport = page.getViewport({ scale: Math.min(3, 1400 / initial.width) });
-			const canvas = activeDocument.body.createEl('canvas', { cls: 'social-converter__pdf-render-canvas' });
-			try {
-				canvas.width = Math.ceil(viewport.width);
-				canvas.height = Math.ceil(viewport.height);
-				const context = canvas.getContext('2d');
-				if (!context) throw new Error('Canvas is unavailable');
-				await page.render({ canvas, canvasContext: context, viewport }).promise;
-				const dataUrl = canvas.toDataURL('image/png');
-				this.pdfPreviewCache.set(cacheKey, dataUrl);
-				return dataUrl;
-			} finally {
-				canvas.remove();
-			}
-		} finally {
-			await document.destroy();
-		}
-	}
-
-	private async readThemeCss(themeId: string): Promise<string | null> {
-		const cached = this.themeCssCache.get(themeId);
-		if (cached !== undefined) return cached;
-		const directory = `${this.app.vault.configDir}/themes/${themeId}`;
-		try {
-			let css = await this.app.vault.adapter.read(`${directory}/theme.css`);
-			css = css.replace(/data:\s+(?=[\w.+-]+\/)/gi, 'data:');
-			css = css.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/gi, (match, _quote: string, rawUrl: string) => {
-				const resource = rawUrl.trim();
-				if (/^(?:data:|https?:|app:|blob:|#)/i.test(resource)) return match;
-				const normalized = resource.replace(/^\.\//, '');
-				return `url("${this.app.vault.adapter.getResourcePath(`${directory}/${normalized}`)}")`;
-			});
-			this.themeCssCache.set(themeId, css);
-			return css;
-		} catch (error) {
-			console.error(`Social Converter could not read theme: ${themeId}`, error);
-			return null;
-		}
-	}
-
-
-	private getThemeManager(): ThemeManager | null {
-		const candidate = (this.app as unknown as { customCss?: ThemeManager }).customCss;
-		return candidate?.themes ? candidate : null;
-	}
-
-	private getInstalledThemes(): Array<[string, string]> {
-		const themes = this.getThemeManager()?.themes ?? {};
-		return Object.entries(themes)
-			.map(([id, manifest]): [string, string] => [id, manifest.name || id])
-			.sort((a, b) => a[1].localeCompare(b[1]));
 	}
 
 	private getFormat(format: CardFormat): { width: number; height: number; label: string } {

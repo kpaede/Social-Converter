@@ -50,7 +50,8 @@ function createExportSnapshot(source: HTMLElement): ExportSnapshot {
 	const original = frameDocument.querySelector<HTMLElement>('.social-converter-card-capture') ?? frameDocument.body;
 	const clone = original.cloneNode(true) as HTMLElement;
 	freezeComputedStyles(original, clone, frameDocument.defaultView ?? window);
-	const bounds = source.getBoundingClientRect();
+	// Use the card’s layout size, never the transformed sidebar preview size.
+	const bounds = original.getBoundingClientRect();
 	clone.style.setProperty('width', `${bounds.width}px`, 'important');
 	clone.style.setProperty('height', `${bounds.height}px`, 'important');
 	const mount = activeDocument.body.createDiv({ cls: 'social-converter__export-snapshot' });

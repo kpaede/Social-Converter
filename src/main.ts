@@ -1,12 +1,13 @@
 import { Plugin, TFile } from 'obsidian';
 import { SocialConverterView, VIEW_TYPE_SOCIAL_CONVERTER } from './ui/social-converter-view';
-import { DEFAULT_SETTINGS, SocialConverterSettings, SocialConverterSettingTab } from './settings';
+import { DEFAULT_SETTINGS, normalizeFontScale, SocialConverterSettings, SocialConverterSettingTab } from './settings';
 
 export default class SocialConverterPlugin extends Plugin {
 	settings: SocialConverterSettings = DEFAULT_SETTINGS;
 
 	async onload(): Promise<void> {
 		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<SocialConverterSettings>);
+		this.settings.fontScale = normalizeFontScale(this.settings.fontScale);
 		this.registerView(VIEW_TYPE_SOCIAL_CONVERTER, (leaf) => new SocialConverterView(leaf, this));
 		this.addSettingTab(new SocialConverterSettingTab(this.app, this));
 		this.addRibbonIcon('share-2', 'Open social converter', () => { void this.openConverter(); });

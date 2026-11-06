@@ -26,6 +26,25 @@ jobs:
                   npm ci
                   npm run build
 
+            - name: Validate plugin
+              run: |
+                  npm run lint
+                  npm run test:browser
+
+            - name: Validate release version
+              run: |
+                  node --input-type=module <<'NODE'
+                  import assert from 'node:assert/strict';
+                  import { readFileSync } from 'node:fs';
+                  const read = (name) => JSON.parse(readFileSync(name, 'utf8'));
+                  const tag = process.env.GITHUB_REF_NAME;
+                  const manifest = read('manifest.json');
+                  assert.equal(manifest.version, tag, 'Tag must match manifest version');
+                  assert.equal(read('package.json').version, tag, 'Package version must match tag');
+                  assert.equal(read('versions.json')[tag], manifest.minAppVersion, 'Missing minimum app version');
+                  assert(readFileSync(`.github/release-notes/${tag}.md`, 'utf8').trim(), 'Release notes must not be empty');
+                  NODE
+
             - name: Check for optional styles
               id: styles
               run: |
@@ -46,5 +65,6 @@ jobs:
 
                   gh release create "$tag" \
                     --title="$tag" \
-                    --draft \
+                    --verify-tag \
+                    --notes-file=".github/release-notes/$tag.md" \
                     main.js manifest.json ${{ steps.styles.outputs.exists == 'true' && 'styles.css' || '' }}
